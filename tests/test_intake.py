@@ -17,19 +17,16 @@ from printing_magic_intake import (
     build_asset_manifest,
     run_listing_intelligence_workflow,
 )
+from printing_magic_intake import intake as intake_module
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_PAPERCLIP_PROJECT_ROOT = Path(
-    "/home/cweber/.paperclip/instances/default/projects/6e564770-9fdc-4fb4-b550-37e41ae47fa1/"
-    "c9e9d509-8117-4fd8-9db8-29283e39764f"
-)
-FIXTURE_ROOT = Path(os.environ.get("WEB17_FIXTURE_ROOT", DEFAULT_PAPERCLIP_PROJECT_ROOT / "shared" / "tailscale-received" / "WEB-17-2026-05-30"))
-MEDIA_ZIP = FIXTURE_ROOT / "collector-s-pitch-sticker-box-media-package.zip"
-MODEL_ZIP = FIXTURE_ROOT / "Collectors_Pitch_Sticker_Box_fb278b1692.zip"
+FIXTURE_ROOT = Path(os.environ["WEB17_FIXTURE_ROOT"]) if "WEB17_FIXTURE_ROOT" in os.environ else None
+MEDIA_ZIP = FIXTURE_ROOT / "collector-s-pitch-sticker-box-media-package.zip" if FIXTURE_ROOT else Path("__missing_web17_media_zip__")
+MODEL_ZIP = FIXTURE_ROOT / "Collectors_Pitch_Sticker_Box_fb278b1692.zip" if FIXTURE_ROOT else Path("__missing_web17_model_zip__")
 
 requires_web17_fixtures = pytest.mark.skipif(
-    not MEDIA_ZIP.exists() or not MODEL_ZIP.exists(),
-    reason="WEB-17 staged fixture zips not available",
+    FIXTURE_ROOT is None or not MEDIA_ZIP.exists() or not MODEL_ZIP.exists(),
+    reason="set WEB17_FIXTURE_ROOT to the staged WEB-17 fixture directory",
 )
 
 
@@ -253,7 +250,7 @@ def test_rejects_unsupported_extension_before_extraction(tmp_path: Path) -> None
         build_asset_manifest([bad_zip], tmp_path / "work", intake_id="intake_unsupported", environment="test")
 
     assert not any(path.is_file() for path in (tmp_path / "work" / "extracted").glob("**/*"))
-    assert "product_intake.zip_validation_failed" in (tmp_path / "work" / "audit-events.jsonl").read_text()
+    assert "product_intake.zip_unsupported_member" in (tmp_path / "work" / "audit-events.jsonl").read_text()
 
 
 def test_rejects_intake_id_path_escape_without_writing_files(tmp_path: Path) -> None:
@@ -272,6 +269,8 @@ def test_rejects_zip_member_over_size_limit(tmp_path: Path) -> None:
 
     with pytest.raises(ArchiveSizeLimitError):
         build_asset_manifest([huge_zip], tmp_path / "work", intake_id="intake_huge", environment="test")
+
+    assert "product_intake.zip_size_limit_exceeded" in (tmp_path / "work" / "audit-events.jsonl").read_text()
 
 
 def test_listing_intelligence_workflow_persists_final_record_transactionally(tmp_path: Path) -> None:
@@ -321,6 +320,102 @@ def test_listing_intelligence_workflow_persists_final_record_transactionally(tmp
         audit_count = conn.execute("SELECT COUNT(*) FROM product_intelligence_audit_events").fetchone()[0]
     assert count == 1
     assert audit_count >= 1
+
+
+def test_low_confidence_product_identity_forces_human_review() -> None:
+    qa_gate = intake_module._evaluate_qa_gate(
+        {"workingName": "Sticker Box", "productType": "storage_box", "confidence": 0.2},
+        {"assetId": "hero", "workingCopyPath": "extracted/hero.png"},
+        {"colorName": "black"},
+        {"title": "Sticker Box", "description": "A storage box."},
+        {"state": "extracted", "publishable": True},
+        {"decision": "pass", "publishable": True},
+    )
+
+    assert qa_gate["status"] == "human_review"
+    assert qa_gate["publishable"] is False
+    assert "productIdentity.lowConfidence" in qa_gate["blockers"]
+    assert "low_confidence_product_identity" in qa_gate["reasonCodes"]
+
+
+def test_publishable_gate_passes_when_required_fields_policy_and_print_are_ok() -> None:
+    qa_gate = intake_module._evaluate_qa_gate(
+        {"workingName": "Ready Box", "productType": "storage_box"},
+        {"assetId": "hero", "workingCopyPath": "extracted/hero.png"},
+        {"colorName": "black"},
+        {"title": "Ready Box", "description": "A storage box."},
+        {"state": "extracted", "publishable": True},
+        {"decision": "pass", "publishable": True},
+    )
+
+    assert qa_gate["status"] == "pass"
+    assert qa_gate["publishable"] is True
+    assert qa_gate["blockers"] == []
+
+
+def test_listing_intelligence_persistence_retries_transient_db_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source_zip = _write_minimal_zip(tmp_path / "fixture.zip")
+    evidence = _write_evidence(tmp_path / "evidence")
+    db_path = tmp_path / "records.sqlite3"
+    original_persist_once = intake_module._persist_final_record_once
+    calls = 0
+
+    def flaky_persist_once(conn: sqlite3.Connection, final_record: dict) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("database is locked")
+        original_persist_once(conn, final_record)
+
+    monkeypatch.setattr(intake_module, "_persist_final_record_once", flaky_persist_once)
+    monkeypatch.setattr(intake_module.time, "sleep", lambda _seconds: None)
+
+    record = run_listing_intelligence_workflow(
+        [source_zip],
+        tmp_path / "work",
+        db_path=db_path,
+        intake_id="intake_retry",
+        environment="test",
+        evidence_paths=evidence,
+    )
+
+    event_names = [event["event_name"] for event in record["auditTrail"]]
+    assert calls == 2
+    assert "listing_intelligence.persistence_retry_scheduled" in event_names
+    assert "listing_intelligence.persistence_committed" in event_names
+
+    with sqlite3.connect(db_path) as conn:
+        db_record = json.loads(conn.execute("SELECT record_json FROM product_intelligence_records").fetchone()[0])
+        db_events = [
+            row[0]
+            for row in conn.execute("SELECT event_name FROM product_intelligence_audit_events ORDER BY event_time")
+        ]
+    assert "listing_intelligence.persistence_retry_scheduled" in db_events
+    assert "listing_intelligence.persistence_committed" in db_events
+    assert "listing_intelligence.persistence_retry_scheduled" in [event["event_name"] for event in db_record["auditTrail"]]
+
+
+def test_db_record_json_and_audit_table_include_terminal_commit_event(tmp_path: Path) -> None:
+    source_zip = _write_minimal_zip(tmp_path / "fixture.zip")
+    evidence = _write_evidence(tmp_path / "evidence")
+    db_path = tmp_path / "records.sqlite3"
+
+    record = run_listing_intelligence_workflow(
+        [source_zip],
+        tmp_path / "work",
+        db_path=db_path,
+        intake_id="intake_terminal_audit",
+        environment="test",
+        evidence_paths=evidence,
+    )
+
+    with sqlite3.connect(db_path) as conn:
+        db_record = json.loads(conn.execute("SELECT record_json FROM product_intelligence_records").fetchone()[0])
+        db_events = [row[0] for row in conn.execute("SELECT event_name FROM product_intelligence_audit_events")]
+
+    assert "listing_intelligence.persistence_committed" in [event["event_name"] for event in record["auditTrail"]]
+    assert "listing_intelligence.persistence_committed" in [event["event_name"] for event in db_record["auditTrail"]]
+    assert "listing_intelligence.persistence_committed" in db_events
 
 
 @requires_web17_fixtures

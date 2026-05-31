@@ -16,10 +16,9 @@ import mimetypes
 import os
 import re
 import sqlite3
-import tempfile
+import time
 import uuid
 import zipfile
-from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -37,6 +36,7 @@ TECHNICAL_ESTIMATE_SCHEMA_VERSION = "technical-estimate.v1"
 POLICY_RESULT_SCHEMA_VERSION = "marketplace-policy-result.v1"
 MAX_EXTRACTED_FILE_BYTES = 64 * 1024 * 1024
 MAX_TOTAL_EXTRACTED_BYTES = 512 * 1024 * 1024
+MIN_PRODUCT_IDENTITY_CONFIDENCE = 0.7
 
 MEDIA_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
 VIDEO_EXTENSIONS = {".webm", ".mp4", ".mov", ".avi", ".mkv"}
@@ -92,17 +92,6 @@ class WorkflowEvidencePaths:
     visual_analysis: Path | None = None
     marketplace_copy: Path | None = None
     technical_estimate: Path | None = None
-
-
-DEFAULT_PROJECT_ROOT = Path(
-    "/home/cweber/.paperclip/instances/default/projects/6e564770-9fdc-4fb4-b550-37e41ae47fa1/"
-    "c9e9d509-8117-4fd8-9db8-29283e39764f"
-)
-DEFAULT_WORKFLOW_EVIDENCE = WorkflowEvidencePaths(
-    visual_analysis=DEFAULT_PROJECT_ROOT / "work-products/WEB-29/visual-analysis-output.json",
-    marketplace_copy=DEFAULT_PROJECT_ROOT / "_default/work-products/WEB-30/marketplace-copy-output.json",
-    technical_estimate=DEFAULT_PROJECT_ROOT / "work-products/WEB-31/metadata-extraction-summary.json",
-)
 
 
 def build_asset_manifest(
@@ -385,7 +374,7 @@ def run_listing_intelligence_workflow(
 ) -> dict[str, Any]:
     """Run deterministic listing-intelligence aggregation and persist final output atomically."""
 
-    evidence_paths = evidence_paths or DEFAULT_WORKFLOW_EVIDENCE
+    evidence_paths = evidence_paths or WorkflowEvidencePaths()
     working_root_path = Path(working_root).resolve()
     db_path = Path(db_path) if db_path is not None else working_root_path / "listing-intelligence.sqlite3"
     manifest = build_asset_manifest(
@@ -446,26 +435,15 @@ def run_listing_intelligence_workflow(
                 **event_context,
             )
         )
-        final_record["auditTrail"].append(
-            _event(
-                "listing_intelligence.persistence_started",
-                status="started",
-                severity="info",
-                finalRecordId=final_record["finalRecordId"],
-                **event_context,
-            )
+        persistence_started = _event(
+            "listing_intelligence.persistence_started",
+            status="started",
+            severity="info",
+            finalRecordId=final_record["finalRecordId"],
+            **event_context,
         )
-        _persist_final_record(db_path, final_record)
-        final_record["auditTrail"].append(
-            _event(
-                "listing_intelligence.persistence_committed",
-                status="succeeded",
-                severity="info",
-                finalRecordId=final_record["finalRecordId"],
-                persistenceRef=_path_ref(Path(db_path)),
-                **event_context,
-            )
-        )
+        final_record["auditTrail"].append(persistence_started)
+        _persist_final_record(db_path, final_record, event_context=event_context)
         _write_json(working_root_path / "product-intelligence-final-v1.json", final_record)
         _write_jsonl(working_root_path / "audit-events.jsonl", final_record["auditTrail"])
         return final_record
@@ -849,12 +827,17 @@ def _evaluate_qa_gate(
         blockers.append("marketplacePolicy.publishable")
     if print_estimate.get("publishable") is not True:
         blockers.append("printEstimate.publishable")
+    confidence_value = product_identity.get("confidence")
+    confidence = _numeric_confidence(confidence_value)
+    if confidence_value is not None and (confidence is None or confidence < MIN_PRODUCT_IDENTITY_CONFIDENCE):
+        blockers.append("productIdentity.lowConfidence")
     return {
         "schemaVersion": "listing-qa-gate.v1",
         "status": "human_review" if blockers else "pass",
         "publishable": not blockers,
         "checks": checks,
         "blockers": sorted(set(blockers)),
+        "reasonCodes": _qa_reason_codes(blockers),
     }
 
 
@@ -934,74 +917,163 @@ def _final_evidence_refs(product_identity: dict[str, Any], marketplace_policy: d
     return refs
 
 
-def _persist_final_record(db_path: Path, final_record: dict[str, Any]) -> None:
+def _persist_final_record(
+    db_path: Path,
+    final_record: dict[str, Any],
+    *,
+    event_context: dict[str, Any] | None = None,
+) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(final_record, sort_keys=True)
-    with _sqlite_connection(db_path) as conn:
+    _remove_audit_events_by_name(final_record, "listing_intelligence.persistence_committed")
+    context = event_context or {}
+    max_attempts = 2
+    for attempt in range(1, max_attempts + 1):
+        persistence_committed = _event(
+            "listing_intelligence.persistence_committed",
+            status="succeeded",
+            severity="info",
+            finalRecordId=final_record["finalRecordId"],
+            persistenceRef=_path_ref(db_path),
+            attempt=attempt,
+            **context,
+        )
         try:
-            conn.execute("BEGIN")
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS product_intelligence_records (
-                    final_record_id TEXT PRIMARY KEY,
-                    intake_id TEXT NOT NULL,
-                    package_set_id TEXT NOT NULL,
-                    manifest_id TEXT NOT NULL,
-                    readiness_verdict TEXT NOT NULL,
-                    publishable INTEGER NOT NULL,
-                    record_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+            final_record["auditTrail"].append(persistence_committed)
+            with _sqlite_connection(db_path) as conn:
+                _persist_final_record_once(conn, final_record)
+            return
+        except Exception as exc:
+            _remove_audit_event(final_record, persistence_committed["event_id"])
+            if attempt < max_attempts and _is_transient_sqlite_error(exc):
+                final_record["auditTrail"].append(
+                    _event(
+                        "listing_intelligence.persistence_retry_scheduled",
+                        status="retrying",
+                        severity="warning",
+                        finalRecordId=final_record["finalRecordId"],
+                        attempt=attempt,
+                        nextAttempt=attempt + 1,
+                        error_code=exc.__class__.__name__,
+                        error_message=_safe_error_message(str(exc)),
+                        **context,
+                    )
                 )
-                """
+                time.sleep(0.05)
+                continue
+            raise PersistenceError("failed to persist final product intelligence record") from exc
+
+
+def _remove_audit_event(final_record: dict[str, Any], event_id: str) -> None:
+    audit_trail = final_record["auditTrail"]
+    audit_trail[:] = [event for event in audit_trail if event.get("event_id") != event_id]
+
+
+def _remove_audit_events_by_name(final_record: dict[str, Any], event_name: str) -> None:
+    audit_trail = final_record["auditTrail"]
+    audit_trail[:] = [event for event in audit_trail if event.get("event_name") != event_name]
+
+
+def _persist_final_record_once(conn: sqlite3.Connection, final_record: dict[str, Any]) -> None:
+    payload = json.dumps(final_record, sort_keys=True)
+    try:
+        conn.execute("BEGIN")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS product_intelligence_records (
+                final_record_id TEXT PRIMARY KEY,
+                intake_id TEXT NOT NULL,
+                package_set_id TEXT NOT NULL,
+                manifest_id TEXT NOT NULL,
+                readiness_verdict TEXT NOT NULL,
+                publishable INTEGER NOT NULL,
+                record_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
             )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS product_intelligence_audit_events (
+                event_id TEXT PRIMARY KEY,
+                final_record_id TEXT NOT NULL,
+                event_time TEXT NOT NULL,
+                event_name TEXT NOT NULL,
+                event_json TEXT NOT NULL,
+                FOREIGN KEY(final_record_id) REFERENCES product_intelligence_records(final_record_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO product_intelligence_records
+            (final_record_id, intake_id, package_set_id, manifest_id, readiness_verdict, publishable, record_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                final_record["finalRecordId"],
+                final_record["intakeId"],
+                final_record["packageSetId"],
+                final_record["manifestId"],
+                final_record["readinessVerdict"],
+                1 if final_record["publishable"] else 0,
+                payload,
+                final_record["createdAt"],
+            ),
+        )
+        conn.execute(
+            "DELETE FROM product_intelligence_audit_events WHERE final_record_id = ?",
+            (final_record["finalRecordId"],),
+        )
+        for event in final_record["auditTrail"]:
             conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS product_intelligence_audit_events (
-                    event_id TEXT PRIMARY KEY,
-                    final_record_id TEXT NOT NULL,
-                    event_time TEXT NOT NULL,
-                    event_name TEXT NOT NULL,
-                    event_json TEXT NOT NULL,
-                    FOREIGN KEY(final_record_id) REFERENCES product_intelligence_records(final_record_id)
-                )
-                """
-            )
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO product_intelligence_records
-                (final_record_id, intake_id, package_set_id, manifest_id, readiness_verdict, publishable, record_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO product_intelligence_audit_events
+                (event_id, final_record_id, event_time, event_name, event_json)
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 (
+                    event["event_id"],
                     final_record["finalRecordId"],
-                    final_record["intakeId"],
-                    final_record["packageSetId"],
-                    final_record["manifestId"],
-                    final_record["readinessVerdict"],
-                    1 if final_record["publishable"] else 0,
-                    payload,
-                    final_record["createdAt"],
+                    event["event_time"],
+                    event["event_name"],
+                    json.dumps(event, sort_keys=True),
                 ),
             )
-            for event in final_record["auditTrail"]:
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO product_intelligence_audit_events
-                    (event_id, final_record_id, event_time, event_name, event_json)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        event["event_id"],
-                        final_record["finalRecordId"],
-                        event["event_time"],
-                        event["event_name"],
-                        json.dumps(event, sort_keys=True),
-                    ),
-                )
-            conn.commit()
-        except Exception as exc:
-            conn.rollback()
-            raise PersistenceError("failed to persist final product intelligence record") from exc
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _numeric_confidence(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _qa_reason_codes(blockers: list[str]) -> list[str]:
+    codes = {
+        "productIdentity.lowConfidence": "low_confidence_product_identity",
+        "marketplacePolicy.publishable": "marketplace_policy_not_publishable",
+        "printEstimate.publishable": "print_estimate_not_publishable",
+    }
+    return sorted(codes.get(blocker, f"missing_{blocker}") for blocker in set(blockers))
+
+
+def _is_transient_sqlite_error(exc: Exception) -> bool:
+    if isinstance(exc, (sqlite3.OperationalError, sqlite3.DatabaseError)):
+        message = str(exc).lower()
+        return any(token in message for token in ("locked", "busy", "temporarily", "interrupted"))
+    return False
 
 
 @contextmanager
@@ -1074,6 +1146,10 @@ def _event(event_name: str, *, status: str, severity: str, **fields: Any) -> dic
 def _failure_event_name(exc: Exception) -> str:
     if isinstance(exc, UnsafeZipEntryError):
         return "product_intake.zip_validation_failed"
+    if isinstance(exc, UnsupportedZipEntryError):
+        return "product_intake.zip_unsupported_member"
+    if isinstance(exc, ArchiveSizeLimitError):
+        return "product_intake.zip_size_limit_exceeded"
     if isinstance(exc, IntakeError):
         return "product_intake.zip_validation_failed"
     return "product_intake.manifest_generation_failed"
